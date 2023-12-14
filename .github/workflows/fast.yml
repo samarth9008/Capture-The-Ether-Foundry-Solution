@@ -1,0 +1,170 @@
+# TODO(Vlad): Factor out common code between the current file and `fast_test.yml`,
+# consider generating the content of an YAML file programmatically. 
+name: Allure fast tests
+env:
+  # Pinning to a specific version that is confirmed to work reliably.
+  # TODO(Grisha): Is it worth it to always use the latest version?
+  ALLURE_RELEASE: "2.24.0"
+  ALLURE_REPORT: "allure_report"
+  ALLURE_RESULTS: "allure_results"
+  TESTS_GROUP: fast
+on:
+  # Run manually.
+  workflow_dispatch:
+  schedule:
+    # Run everyday at 01:00 UTC.
+    - cron:  '0 1 * * *'  
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  run_fast_tests_allure_report_generator:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Pass AWS credentials via GH secrets. This is needed to pull the Docker image
+      # that will be used to run the action.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.CK_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.CK_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.CK_AWS_DEFAULT_REGION }}
+
+      # This is needed to pull the Docker image.
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      # Make everything accessible by any user to avoid permission errors.
+      - name: Cleanup
+        run: sudo chmod 777 -R .
+
+      # Check out the code from GitHub so that we can run the action inside
+      # the Docker container.
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          submodules: true
+          token: ${{ secrets.GH_ACTION_ACCESS_TOKEN }}
+
+      # Install packages that are required to run the job via GH.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r .github/gh_requirements.txt
+
+      # Pull the latest Docker image to run the regressions on.
+      - name: Pull image
+        env:
+          CK_ECR_BASE_PATH: ${{ secrets.CK_ECR_BASE_PATH }}
+        run: invoke docker_pull
+
+      # Set up environment variables that will be used in the next steps.
+      # TODO(Grisha): Move the logic to Python, we have functions to get the
+      # repo name, current timestamp, etc.
+      - name: Setup environment variables
+        run:  |
+          # Current timestamp in format YYYYMMDD_HHMMSS. Example: 20200730_153000
+          echo "CURRENT_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")" >> $GITHUB_ENV
+          # E.g., `$GITHUB_REPOSITORY="cryptokaizen/cmamp"` but we need `cmamp` only.
+          echo "REPO_NAME=$(echo $GITHUB_REPOSITORY | awk -F '/' '{print $2}')" >> $GITHUB_ENV
+          REPO_NAME=$(echo $GITHUB_REPOSITORY | awk -F '/' '{print $2}')
+          # Get the name of the last report directory. E.g., `report.20200730_153000`.
+          LAST_REPORT_DIR=$(aws s3 ls s3://cryptokaizen-html/allure_reports/${REPO_NAME}/${TESTS_GROUP}/ | tail -n 1 | awk '{print $NF}')
+          LAST_REPORT_DIR=${LAST_REPORT_DIR%/}
+          echo "LAST_REPORT_DIR=${LAST_REPORT_DIR}" >> $GITHUB_ENV
+
+      # Run the `invoke` target `run_fast_tests` to run tests that are under 5 seconds.
+      # See the corresponding documentation for more information.
+      - name: Run fast tests with Allure
+        # Need to continue on failing tests to generate the report.
+        continue-on-error: true
+        env:
+          AM_AWS_ACCESS_KEY_ID: ${{ secrets.AM_AWS_ACCESS_KEY_ID }}
+          AM_AWS_SECRET_ACCESS_KEY: ${{ secrets.AM_AWS_SECRET_ACCESS_KEY }}
+          AM_AWS_DEFAULT_REGION: ${{ secrets.AM_AWS_DEFAULT_REGION }}
+          AM_ECR_BASE_PATH: ${{ secrets.AM_ECR_BASE_PATH }}
+          AM_AWS_S3_BUCKET: ${{ secrets.AM_AWS_S3_BUCKET }}
+          AM_TELEGRAM_TOKEN: ${{ secrets.AM_TELEGRAM_TOKEN }}
+          CK_AWS_ACCESS_KEY_ID: ${{ secrets.CK_AWS_ACCESS_KEY_ID }}
+          CK_AWS_SECRET_ACCESS_KEY: ${{ secrets.CK_AWS_SECRET_ACCESS_KEY }}
+          CK_AWS_DEFAULT_REGION: ${{ secrets.CK_AWS_DEFAULT_REGION }}
+          CK_ECR_BASE_PATH: ${{ secrets.CK_ECR_BASE_PATH }}
+          CK_AWS_S3_BUCKET: ${{ secrets.CK_AWS_S3_BUCKET }}
+          CK_TELEGRAM_TOKEN: ${{ secrets.CK_TELEGRAM_TOKEN }}
+          GH_ACTION_ACCESS_TOKEN: ${{ secrets.GH_ACTION_ACCESS_TOKEN }}
+        # The allure test output will be stored in the `./allure_results` directory.
+        # TODO(Grisha): document what will happen if we do not change the
+        # permissions and check if there is a more robust solution.
+        # The current solution is not a good practice in terms of security. 
+        run: |
+          invoke run_fast_tests --allure-dir "$ALLURE_RESULTS"
+          sudo chmod 777 -R $ALLURE_RESULTS
+
+      # Verify that the Allure results directory is not empty before proceeding.
+      - name: Check Allure dir
+        run: |
+          if [ -z "$(ls -A $ALLURE_RESULTS)" ]; then
+            echo "$ALLURE_RESULTS directory is empty"
+            exit 1
+          fi
+
+      # Back up the Allure results to the AWS S3 bucket.
+      # TODO(Grisha): consider moving the logic to Python, e.g., create an
+      # invoke target `def backup_allure_results(allure_results_dir,
+      # tests_group)`.      
+      - name: Backup the Allure results
+        run: | 
+          aws s3 cp $ALLURE_RESULTS s3://cryptokaizen-unit-test/allure_test/${REPO_NAME}/${TESTS_GROUP}/results.${CURRENT_TIMESTAMP} --recursive
+
+      # Copy the history of the last report to the current results dir to have
+      # the trends in the report.
+      # TODO(Grisha): move the logic to Python, e.g., `def allure_copy_history(...)`.
+      - name: Copy history
+        run: |
+          aws s3 cp s3://cryptokaizen-html/allure_reports/${REPO_NAME}/${TESTS_GROUP}/${LAST_REPORT_DIR}/history $ALLURE_RESULTS/history --recursive
+
+      # Generate the Allure HTML-report.
+      # Using `./allure_results` as input to generate Allure HTML report which
+      # will be stored at `./allure_report`.
+      # TODO(Grisha): consider moving Allure-Report installation to a separate
+      # `.sh` script and here we just call a script.      
+      - name: Generate HTML-report
+        run: |
+          # Install Allure Report utility.
+          ALLURE_REPO=https://repo.maven.apache.org/maven2/io/qameta/allure/allure-commandline
+          wget --no-verbose -O /tmp/allure-$ALLURE_RELEASE.tgz $ALLURE_REPO/$ALLURE_RELEASE/allure-commandline-$ALLURE_RELEASE.tgz
+          tar -xf /tmp/allure-$ALLURE_RELEASE.tgz -C /opt/
+          chmod -R +x /opt/allure-$ALLURE_RELEASE/bin
+          PATH=$PATH:/opt/allure-$ALLURE_RELEASE/bin
+          # Generate HTML Allure report.
+          allure generate $ALLURE_RESULTS -o $ALLURE_REPORT
+
+      # Back up the Allure-HTML report to the AWS S3 HTML-bucket.
+      # TODO(Grisha): move to Python and create an invoke target, e.g.,
+      # `def backup_allure_html_report(allure_report_dir, test_group)`.
+      - name: Backup the Allure HTML-report
+        run: | 
+          aws s3 cp $ALLURE_REPORT s3://cryptokaizen-html/allure_reports/${REPO_NAME}/${TESTS_GROUP}/report.${CURRENT_TIMESTAMP} --recursive
+
+      # TODO(Grisha): move the logic to Python, e.g., `def allure_display_report_url(...)`.
+      # Show the report URL in the GH Actions log.
+      - name: Report URL
+        run: |
+          echo "Report URL:"
+          echo "http://172.30.2.44/allure_reports/${REPO_NAME}/${TESTS_GROUP}/report.${CURRENT_TIMESTAMP}/index.html"
+
+      # In case of manual run, this workflow step will not be skipped and
+      # info in the step will be in format as seen in `with` statement.
+      # Blank with no info and skipped otherwise.
+      - name: Post status if was triggered manually
+        if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+        uses: Sibz/github-status-action@v1
+        with:
+          authToken: ${{ secrets.GH_ACTION_ACCESS_TOKEN }}
+          context: "allure.run_fast_tests"
+          description: 'Job is done (manual run)'
+          state: ${{ job.status }}
+          sha: ${{ github.sha }}
+          target_url: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
